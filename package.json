@@ -16,6 +16,7 @@
   "private": "true",
   "dependencies": {
     "@opencode-ai/sdk": "^1.1.65",
+    "cron-parser": "^5.5.0",
     "discord.js": "^14.25.1"
   },
   "devDependencies": {

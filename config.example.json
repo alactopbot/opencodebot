@@ -1,4 +1,11 @@
 {
+  "cron": {
+    "enabled": false,
+    "maxConcurrentRuns": 2,
+    "catchUpWindowMinutes": 60,
+    "maxCatchUpRunsPerJob": 20,
+    "defaultTimeoutMs": 600000
+  },
   "opencode": {
     "hostname": "127.0.0.1",
     "projectDirectory": "/home/admin/workspace",

@@ -31,6 +31,13 @@ export type AppConfig = {
       password?: string;
     };
   };
+  cron?: {
+    enabled?: boolean;
+    maxConcurrentRuns?: number;
+    catchUpWindowMinutes?: number;
+    maxCatchUpRunsPerJob?: number;
+    defaultTimeoutMs?: number;
+  };
   channels?: {
     discord?: DiscordChannelConfig;
   };
