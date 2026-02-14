@@ -18,7 +18,6 @@ type CronSchedulerOptions = {
   catchUpWindowMinutes: number;
   maxCatchUpRunsPerJob: number;
   defaultTimeoutMs: number;
-  logLevel?: "info" | "debug";
   jobsPath?: string;
   runsDir?: string;
   runPrompt: (input: { channelKey: string; prompt: string; systemPrompt?: string }) => Promise<string>;
@@ -357,11 +356,9 @@ export class CronScheduler {
         try {
           const expectedNext = nextRunAtMs(raw.schedule, now);
           if (state.nextRunAtMs !== expectedNext) {
-            if (this.options.logLevel === "debug") {
-              console.log(
-                `[opencodebot] cron stale nextRunAtMs detected job=${raw.id} stored=${state.nextRunAtMs} expected=${expectedNext}, recalculating`,
-              );
-            }
+            console.log(
+              `[opencodebot] cron stale nextRunAtMs detected job=${raw.id} stored=${state.nextRunAtMs} expected=${expectedNext}, recalculating`,
+            );
             state.nextRunAtMs = expectedNext;
           }
         } catch { /* schedule parse error handled above */ }
@@ -463,7 +460,6 @@ export function defaultCronOptions(config: {
   catchUpWindowMinutes?: number;
   maxCatchUpRunsPerJob?: number;
   defaultTimeoutMs?: number;
-  logLevel?: "info" | "debug";
 }) {
   return {
     enabled: config.enabled === true,
@@ -471,6 +467,5 @@ export function defaultCronOptions(config: {
     catchUpWindowMinutes: Math.max(1, config.catchUpWindowMinutes ?? 60),
     maxCatchUpRunsPerJob: Math.max(1, config.maxCatchUpRunsPerJob ?? 20),
     defaultTimeoutMs: Math.max(10_000, config.defaultTimeoutMs ?? 600_000),
-    logLevel: config.logLevel ?? "info",
   };
 }

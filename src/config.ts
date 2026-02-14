@@ -37,7 +37,6 @@ export type AppConfig = {
     catchUpWindowMinutes?: number;
     maxCatchUpRunsPerJob?: number;
     defaultTimeoutMs?: number;
-    logLevel?: "info" | "debug";
   };
   channels?: {
     discord?: DiscordChannelConfig;
