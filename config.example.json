@@ -4,7 +4,8 @@
     "maxConcurrentRuns": 2,
     "catchUpWindowMinutes": 60,
     "maxCatchUpRunsPerJob": 20,
-    "defaultTimeoutMs": 600000
+    "defaultTimeoutMs": 600000,
+    "logLevel": "info"
   },
   "opencode": {
     "hostname": "127.0.0.1",
