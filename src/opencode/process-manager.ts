@@ -126,10 +126,7 @@ export class ProcessManager {
 
   async setModel(channelKey: string, model: string): Promise<void> {
     const runtime = await this.ensureRuntime(channelKey);
-    const parsed = parseModelSpec(model);
-    if (!parsed) {
-      throw new Error("Invalid model format. Use provider/model");
-    }
+    const parsed = await this.resolveModelSpec(runtime, model);
     runtime.modelOverride = `${parsed.providerID}/${parsed.modelID}`;
     await this.sessions.setModel(channelKey, runtime.modelOverride);
     console.log(`[opencodebot] [${channelKey}] model override set to ${runtime.modelOverride}`);
@@ -156,6 +153,27 @@ export class ProcessManager {
       // ignore
     }
     return { override: runtime.modelOverride, current };
+  }
+
+  async listModels(channelKey: string): Promise<string[]> {
+    const runtime = await this.ensureRuntime(channelKey);
+    console.log(`[opencodebot] [${channelKey}] -> opencode list models`);
+    const response = await requestJson<{
+      providers?: Array<{ id?: string; models?: Record<string, { id?: string; name?: string }> }>;
+    }>(this.config, runtime.baseUrl, "/config/providers", { method: "GET" });
+    const out: string[] = [];
+    for (const provider of response.providers || []) {
+      const providerID = provider.id;
+      if (!providerID) continue;
+      for (const [key, model] of Object.entries(provider.models || {})) {
+        const modelID = model?.id || model?.name || key;
+        if (!modelID) continue;
+        out.push(`${providerID}/${modelID}`);
+      }
+    }
+    const unique = Array.from(new Set(out)).sort();
+    console.log(`[opencodebot] [${channelKey}] <- opencode list models count=${unique.length}`);
+    return unique;
   }
 
   async runSlashCommand(channelKey: string, command: string, args: string[] = []): Promise<string> {
@@ -333,6 +351,39 @@ export class ProcessManager {
     } catch {
       return undefined;
     }
+  }
+
+  private async getLatestAssistantProvider(runtime: RuntimeEntry): Promise<string | undefined> {
+    try {
+      const messages = await requestJson<Array<{ info?: JsonRecord }>>(
+        this.config,
+        runtime.baseUrl,
+        `/session/${runtime.sessionID}/message?limit=20`,
+        { method: "GET" },
+      );
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const info = messages[i]?.info;
+        if (info?.role === "assistant" && typeof info.providerID === "string") {
+          return info.providerID;
+        }
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async resolveModelSpec(runtime: RuntimeEntry, input: string): Promise<{ providerID: string; modelID: string }> {
+    const direct = parseModelSpec(input);
+    if (direct) return direct;
+    const trimmed = input.trim();
+    if (!trimmed) {
+      throw new Error("Invalid model format. Use provider/model or modelID");
+    }
+    const fromOverride = parseModelSpec(runtime.modelOverride)?.providerID;
+    const fromSession = await this.getLatestAssistantProvider(runtime);
+    const providerID = fromOverride || fromSession || "volcengine";
+    return { providerID, modelID: trimmed };
   }
 
   private async startEventStream(runtime: RuntimeEntry): Promise<void> {

@@ -72,12 +72,13 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       new SlashCommandBuilder().setName("new").setDescription("Create a new OpenCode session"),
       new SlashCommandBuilder().setName("compact").setDescription("Run OpenCode compact command"),
       new SlashCommandBuilder().setName("sessions").setDescription("List OpenCode sessions"),
+      new SlashCommandBuilder().setName("models").setDescription("List available models"),
       new SlashCommandBuilder()
         .setName("model")
         .setDescription("Get or set model for this conversation")
         .addStringOption((opt) =>
           opt
-            .setName("name")
+            .setName("model")
             .setDescription("provider/model, eg volcengine/glm-4.7")
             .setRequired(false),
         ),
@@ -170,21 +171,39 @@ export class DiscordChannelAdapter implements ChannelAdapter {
         return;
       }
       if (interaction.commandName === "model") {
-        const name = interaction.options.getString("name");
+        const name = interaction.options.getString("model") || interaction.options.getString("name");
         if (name) {
           console.log(`[opencodebot] [${key}] discord slash /model ${name}`);
           await this.manager.setModel(key, name);
-          await interaction.reply(`Model override set to: \`${name}\``);
+          const model = await this.manager.getModel(key);
+          console.log(
+            `[opencodebot] [${key}] /model applied. requested="${name}" effective="${model.override ?? "none"}"`,
+          );
+          await interaction.reply(`Model override set to: \`${model.override ?? name}\``);
         } else {
           console.log(`[opencodebot] [${key}] discord slash /model`);
           const model = await this.manager.getModel(key);
+          console.log(
+            `[opencodebot] [${key}] /model query. override="${model.override ?? "none"}" current="${model.current ?? "unknown"}"`,
+          );
           await interaction.reply(
             `Model override: \`${model.override ?? "(none)"}\`\nCurrent model: \`${model.current ?? "(unknown)"}\``,
           );
         }
+        return;
+      }
+      if (interaction.commandName === "models") {
+        console.log(`[opencodebot] [${key}] discord slash /models`);
+        const models = await this.manager.listModels(key);
+        const text = models.length ? models.map((m) => `- ${m}`).join("\n") : "(no models)";
+        await interaction.reply(text.slice(0, MAX_MESSAGE_LENGTH));
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      console.error(
+        `[opencodebot] [${key}] discord slash /${interaction.commandName} failed: ${message}`,
+        error,
+      );
       if (interaction.replied || interaction.deferred) {
         await interaction.followUp(`Error: ${message}`);
       } else {
