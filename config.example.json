@@ -1,0 +1,33 @@
+{
+  "opencode": {
+    "hostname": "127.0.0.1",
+    "projectDirectory": "/home/admin/workspace/notes",
+    "autoApprovePermissions": true
+  },
+  "channels": {
+    "discord": {
+      "enabled": true,
+      "token": "YOUR_DISCORD_BOT_TOKEN",
+      "allowBots": false,
+      "groupPolicy": "allowlist",
+      "guilds": {
+        "1467331665155330081": {
+          "requireMention": false,
+          "users": ["1465289213900623966"],
+          "channels": {
+            "1467331666140860579": {
+              "allow": true
+            },
+            "1467728482024034366": {
+              "allow": true,
+              "systemPrompt": "你是一位记录员,工作目录:/home/admin/workspace/notes,工作准则skill:/home/admin/workspace/notes/.claude/skills/note-collector"
+            },
+            "1468124567842066474": {
+              "allow": true
+            }
+          }
+        }
+      }
+    }
+  }
+}
