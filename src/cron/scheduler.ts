@@ -36,6 +36,27 @@ function nextRunAtMs(schedule: string, fromMs: number): number {
   return CronExpressionParser.parse(schedule, { currentDate: new Date(fromMs) }).next().getTime();
 }
 
+function isAlignedRunAtMs(schedule: string, runAtMs: number): boolean {
+  if (!Number.isFinite(runAtMs) || runAtMs <= 0) return false;
+  try {
+    return nextRunAtMs(schedule, runAtMs - 1) === runAtMs;
+  } catch {
+    return false;
+  }
+}
+
+function isSameState(a?: CronJobState, b?: CronJobState): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return (
+    a.nextRunAtMs === b.nextRunAtMs &&
+    a.lastRunAtMs === b.lastRunAtMs &&
+    a.lastStatus === b.lastStatus &&
+    a.lastError === b.lastError &&
+    a.lastDurationMs === b.lastDurationMs
+  );
+}
+
 function isSupportedSchedule(schedule: string): boolean {
   const trimmed = schedule.trim();
   if (trimmed.startsWith("@")) return false;
@@ -338,6 +359,7 @@ export class CronScheduler {
     this.lastReloadAtMs = now;
     const loaded = await this.store.loadJobs();
     const next = new Map<string, CronJob>();
+    let stateAdjusted = false;
     for (const raw of loaded) {
       if (!raw || typeof raw.id !== "string" || typeof raw.schedule !== "string") continue;
       if (!raw.target?.guildId || !raw.target?.channelId || typeof raw.prompt !== "string") continue;
@@ -349,15 +371,15 @@ export class CronScheduler {
       const scheduleChanged = !!existing && existing.schedule !== raw.schedule;
       const state = this.normalizeState(raw.state, raw.schedule, existing?.state, now, raw.id, scheduleChanged);
 
-      // Detect stale nextRunAtMs: if file has a future nextRunAtMs but it doesn't
-      // match what this schedule would produce, force recalc (covers manual edits
-      // across restarts where we have no in-memory baseline to detect the change).
-      if (!scheduleChanged && state.nextRunAtMs > now) {
+      // Detect stale nextRunAtMs: if file state doesn't align with current schedule,
+      // force recalc (covers manual edits across restarts without in-memory baseline).
+      if (!scheduleChanged && state.nextRunAtMs > 0) {
         try {
+          const aligned = isAlignedRunAtMs(raw.schedule, state.nextRunAtMs);
           const expectedNext = nextRunAtMs(raw.schedule, now);
-          if (state.nextRunAtMs !== expectedNext) {
+          if (!aligned || (state.nextRunAtMs > now && state.nextRunAtMs !== expectedNext)) {
             console.log(
-              `[opencodebot] cron stale nextRunAtMs detected job=${raw.id} stored=${state.nextRunAtMs} expected=${expectedNext}, recalculating`,
+              `[opencodebot] cron stale nextRunAtMs detected job=${raw.id} stored=${state.nextRunAtMs} expected=${expectedNext} aligned=${aligned}, recalculating`,
             );
             state.nextRunAtMs = expectedNext;
           }
@@ -369,9 +391,11 @@ export class CronScheduler {
           `[opencodebot] cron schedule reloaded job=${raw.id} from="${existing?.schedule}" to="${raw.schedule}" nextRunAtMs=${state.nextRunAtMs}`,
         );
       }
+      const changed = !isSameState(state, raw.state);
+      if (changed) stateAdjusted = true;
       next.set(raw.id, {
         ...raw,
-        updatedAtMs: raw.updatedAtMs || now,
+        updatedAtMs: changed ? now : (raw.updatedAtMs || now),
         createdAtMs: raw.createdAtMs || now,
         state,
       });
@@ -384,6 +408,9 @@ export class CronScheduler {
     this.jobs.clear();
     for (const [id, job] of next) {
       this.jobs.set(id, job);
+    }
+    if (stateAdjusted) {
+      await this.persistJobs();
     }
   }
 
