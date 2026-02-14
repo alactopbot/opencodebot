@@ -31,4 +31,11 @@ npm start
 - One Discord channel/thread maps to one OpenCode server process.
 - Channel/thread to session mapping is persisted in `~/.opencodebot/sessions.json`.
 - On process restart, bot tries to recover previous session by session ID.
-- Slash commands: `/new`, `/compact`, `/sessions`, `/models`, `/model`.
+- Slash commands: `/new`, `/plan`, `/compact`, `/sessions`, `/models`, `/model`.
+
+### Slash command notes
+
+- `/plan task:<text>` uses OpenCode native plan agent (`agent: "plan"`).
+- `/models` lists currently available models from OpenCode `/config/providers`.
+- `/model model:<provider/model>` sets model override for current conversation.
+- `/model model:<modelID>` is also supported (provider inferred from current session/override).

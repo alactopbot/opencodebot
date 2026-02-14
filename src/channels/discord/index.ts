@@ -59,6 +59,9 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       if (!interaction.isChatInputCommand()) return;
       await this.handleCommand(interaction);
     });
+    this.client.on(Events.Error, (error) => {
+      console.error("[opencodebot] discord client error", error);
+    });
 
     await this.client.login(this.config.token);
   }
@@ -70,6 +73,10 @@ export class DiscordChannelAdapter implements ChannelAdapter {
   private async registerCommands() {
     const commands = [
       new SlashCommandBuilder().setName("new").setDescription("Create a new OpenCode session"),
+      new SlashCommandBuilder()
+        .setName("plan")
+        .setDescription("Run plan-mode request (task optional)")
+        .addStringOption((opt) => opt.setName("task").setDescription("Task content to run in plan mode").setRequired(false)),
       new SlashCommandBuilder().setName("compact").setDescription("Run OpenCode compact command"),
       new SlashCommandBuilder().setName("sessions").setDescription("List OpenCode sessions"),
       new SlashCommandBuilder().setName("models").setDescription("List available models"),
@@ -149,17 +156,31 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     }
 
     const key = interactionKey(interaction);
+    await interaction.deferReply();
     try {
       if (interaction.commandName === "new") {
         console.log(`[opencodebot] [${key}] discord slash /new`);
         const sessionID = await this.manager.resetSession(key);
-        await interaction.reply(`Started new session: \`${sessionID}\``);
+        await interaction.editReply(`Started new session: \`${sessionID}\``);
+        return;
+      }
+      if (interaction.commandName === "plan") {
+        const task = interaction.options.getString("task");
+        if (task?.trim()) {
+          console.log(`[opencodebot] [${key}] discord slash /plan task="${preview(task)}"`);
+          const output = await this.manager.promptPlan(key, task.trim());
+          await interaction.editReply(output.slice(0, MAX_MESSAGE_LENGTH));
+        } else {
+          console.log(`[opencodebot] [${key}] discord slash /plan (no task)`);
+          const output = await this.manager.runSlashCommand(key, "plan");
+          await interaction.editReply(output.slice(0, MAX_MESSAGE_LENGTH));
+        }
         return;
       }
       if (interaction.commandName === "compact") {
         console.log(`[opencodebot] [${key}] discord slash /compact`);
         const output = await this.manager.runSlashCommand(key, "compact");
-        await interaction.reply(output.slice(0, MAX_MESSAGE_LENGTH));
+        await interaction.editReply(output.slice(0, MAX_MESSAGE_LENGTH));
         return;
       }
       if (interaction.commandName === "sessions") {
@@ -167,7 +188,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
         const sessions = await this.manager.listSessions(key);
         const summary =
           sessions.slice(0, 10).map((s) => `- ${s.id} ${s.title || ""}`).join("\n") || "(none)";
-        await interaction.reply(summary.slice(0, MAX_MESSAGE_LENGTH));
+        await interaction.editReply(summary.slice(0, MAX_MESSAGE_LENGTH));
         return;
       }
       if (interaction.commandName === "model") {
@@ -179,14 +200,14 @@ export class DiscordChannelAdapter implements ChannelAdapter {
           console.log(
             `[opencodebot] [${key}] /model applied. requested="${name}" effective="${model.override ?? "none"}"`,
           );
-          await interaction.reply(`Model override set to: \`${model.override ?? name}\``);
+          await interaction.editReply(`Model override set to: \`${model.override ?? name}\``);
         } else {
           console.log(`[opencodebot] [${key}] discord slash /model`);
           const model = await this.manager.getModel(key);
           console.log(
             `[opencodebot] [${key}] /model query. override="${model.override ?? "none"}" current="${model.current ?? "unknown"}"`,
           );
-          await interaction.reply(
+          await interaction.editReply(
             `Model override: \`${model.override ?? "(none)"}\`\nCurrent model: \`${model.current ?? "(unknown)"}\``,
           );
         }
@@ -196,7 +217,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
         console.log(`[opencodebot] [${key}] discord slash /models`);
         const models = await this.manager.listModels(key);
         const text = models.length ? models.map((m) => `- ${m}`).join("\n") : "(no models)";
-        await interaction.reply(text.slice(0, MAX_MESSAGE_LENGTH));
+        await interaction.editReply(text.slice(0, MAX_MESSAGE_LENGTH));
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -204,10 +225,14 @@ export class DiscordChannelAdapter implements ChannelAdapter {
         `[opencodebot] [${key}] discord slash /${interaction.commandName} failed: ${message}`,
         error,
       );
-      if (interaction.replied || interaction.deferred) {
-        await interaction.followUp(`Error: ${message}`);
-      } else {
-        await interaction.reply(`Error: ${message}`);
+      try {
+        if (interaction.replied || interaction.deferred) {
+          await interaction.editReply(`Error: ${message}`);
+        } else {
+          await interaction.reply(`Error: ${message}`);
+        }
+      } catch (replyError) {
+        console.error(`[opencodebot] [${key}] failed to send slash error reply`, replyError);
       }
     }
   }

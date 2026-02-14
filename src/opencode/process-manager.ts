@@ -8,6 +8,7 @@ type RuntimeEntry = {
   close: () => void;
   sessionID: string;
   modelOverride?: string;
+  currentMode?: string;
   abort: AbortController;
   streamTask?: Promise<void>;
   latestMessageID?: string;
@@ -197,11 +198,24 @@ export class ProcessManager {
   }
 
   async prompt(channelKey: string, text: string, systemPrompt?: string): Promise<string> {
+    return this.promptInternal(channelKey, text, systemPrompt);
+  }
+
+  async promptPlan(channelKey: string, text: string): Promise<string> {
+    return this.promptInternal(channelKey, text, undefined, "plan");
+  }
+
+  private async promptInternal(
+    channelKey: string,
+    text: string,
+    systemPrompt?: string,
+    agentOverride?: string,
+  ): Promise<string> {
     const runtime = await this.ensureRuntime(channelKey);
     console.log(
       `[opencodebot] [${channelKey}] -> opencode prompt(session=${runtime.sessionID}) text="${preview(text)}"${
         systemPrompt ? " with systemPrompt" : ""
-      }${runtime.modelOverride ? ` model=${runtime.modelOverride}` : ""}`,
+      }${runtime.modelOverride ? ` model=${runtime.modelOverride}` : ""}${agentOverride ? ` agent=${agentOverride}` : ""}`,
     );
     const baselineMessageID = await this.getLatestAssistantMessageID(runtime);
     const result = new Promise<string>((resolve, reject) => {
@@ -213,6 +227,9 @@ export class ProcessManager {
     const body: JsonRecord = {
       parts: [{ type: "text", text }],
     };
+    if (agentOverride) {
+      body.agent = agentOverride;
+    }
     const parsedModel = parseModelSpec(runtime.modelOverride);
     if (parsedModel) {
       body.model = parsedModel;
@@ -286,6 +303,7 @@ export class ProcessManager {
       close: server.close,
       sessionID: "",
       modelOverride: this.sessions.get(channelKey)?.model,
+      currentMode: "build",
       abort: new AbortController(),
       messageOrder: [],
       messageTexts: new Map(),
@@ -450,6 +468,16 @@ export class ProcessManager {
       }
       runtime.latestMessageID = part.messageID;
       runtime.messageTexts.set(part.messageID, String(part.text ?? ""));
+      return;
+    }
+    if (payload.type === "message.updated") {
+      const info = payload.properties?.info;
+      if (info?.sessionID === runtime.sessionID && info?.role === "assistant" && typeof info?.mode === "string") {
+        if (runtime.currentMode !== info.mode) {
+          runtime.currentMode = info.mode;
+          console.log(`[opencodebot] [${runtime.channelKey}] mode switched to ${runtime.currentMode}`);
+        }
+      }
       return;
     }
     if (payload.type === "permission.asked") {
