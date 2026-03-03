@@ -26,6 +26,7 @@ export type AppConfig = {
     hostname?: string;
     projectDirectory?: string;
     autoApprovePermissions?: boolean;
+    runtimeIdleTimeoutMs?: number;
     auth?: {
       username?: string;
       password?: string;

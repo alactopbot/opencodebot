@@ -9,7 +9,8 @@
   "opencode": {
     "hostname": "127.0.0.1",
     "projectDirectory": "/home/admin/workspace",
-    "autoApprovePermissions": true
+    "autoApprovePermissions": true,
+    "runtimeIdleTimeoutMs": 600000
   },
   "channels": {
     "discord": {

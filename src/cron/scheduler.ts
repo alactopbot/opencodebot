@@ -303,7 +303,9 @@ export class CronScheduler {
     let output = "";
     let errorText: string | undefined;
     try {
-      console.log(`[opencodebot] cron executing job=${job.id} runId=${req.runId} runAtMs=${req.runAtMs}`);
+      console.log(
+        `[opencodebot] cron executing job=${job.id} runId=${req.runId} runAtMs=${req.runAtMs} channelKey=${channelKey}`,
+      );
       job.state.lastStatus = "running";
       job.updatedAtMs = startedAt;
       await this.persistJobs();

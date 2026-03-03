@@ -20,6 +20,8 @@ type RuntimeEntry = {
     reject: (reason?: unknown) => void;
     timer: NodeJS.Timeout;
   }>;
+  lastActivityTime: number;
+  createdAt: number;
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -81,8 +83,22 @@ export class ProcessManager {
     await this.sessions.load();
     console.log("[opencodebot] session store loaded, runtime monitor starting");
     this.monitorTimer = setInterval(async () => {
+      const now = Date.now();
+      const idleTimeoutMs = this.config.opencode?.runtimeIdleTimeoutMs ?? 10 * 60 * 1000; // 默认 10 分钟
+      
       for (const [channelKey] of this.runtimes) {
         try {
+          // 首先检查是否空闲超时
+          const runtime = this.runtimes.get(channelKey);
+          if (runtime && now - runtime.lastActivityTime > idleTimeoutMs) {
+            console.log(
+              `[opencodebot] [${channelKey}] runtime idle for ${Math.round((now - runtime.lastActivityTime) / 1000)}s (limit: ${Math.round(idleTimeoutMs / 1000)}s), disposing`,
+            );
+            await this.disposeRuntime(runtime);
+            continue;
+          }
+          
+          // 然后检查健康状态
           await this.recoverIfUnhealthy(channelKey);
         } catch (error) {
           console.error(`[opencodebot] runtime monitor failed for ${channelKey}`, error);
@@ -212,6 +228,7 @@ export class ProcessManager {
     agentOverride?: string,
   ): Promise<string> {
     const runtime = await this.ensureRuntime(channelKey);
+    runtime.lastActivityTime = Date.now();
     console.log(
       `[opencodebot] [${channelKey}] -> opencode prompt(session=${runtime.sessionID}) text="${preview(text)}"${
         systemPrompt ? " with systemPrompt" : ""
@@ -297,6 +314,7 @@ export class ProcessManager {
       port: 0,
       timeout: 10000,
     });
+    const now = Date.now();
     const runtime: RuntimeEntry = {
       channelKey,
       baseUrl: server.url,
@@ -308,12 +326,14 @@ export class ProcessManager {
       messageOrder: [],
       messageTexts: new Map(),
       pendingPrompts: [],
+      lastActivityTime: now,
+      createdAt: now,
     };
 
     const saved = preferredSessionID || this.sessions.get(channelKey)?.sessionID;
     if (saved && (await this.sessionExists(runtime.baseUrl, saved))) {
       runtime.sessionID = saved;
-      console.log(`[opencodebot] [${channelKey}] restored session: ${saved} @ ${runtime.baseUrl}`);
+      console.log(`[opencodebot] [${channelKey}] runtime process opened (restored session: ${saved} @ ${runtime.baseUrl})`);
     } else {
       const created = await requestJson<{ id: string }>(this.config, runtime.baseUrl, "/session", {
         method: "POST",
@@ -321,7 +341,7 @@ export class ProcessManager {
       });
       runtime.sessionID = created.id;
       await this.sessions.set(channelKey, created.id);
-      console.log(`[opencodebot] [${channelKey}] created session: ${created.id} @ ${runtime.baseUrl}`);
+      console.log(`[opencodebot] [${channelKey}] runtime process opened (created session: ${created.id} @ ${runtime.baseUrl})`);
     }
 
     this.runtimes.set(channelKey, runtime);
@@ -341,14 +361,20 @@ export class ProcessManager {
   }
 
   private async disposeRuntime(runtime: RuntimeEntry) {
+    const idleSeconds = Math.round((Date.now() - runtime.lastActivityTime) / 1000);
+    const runDurationSeconds = Math.round((Date.now() - runtime.createdAt) / 1000);
+    console.log(
+      `[opencodebot] [${runtime.channelKey}] closing runtime process (idle: ${idleSeconds}s, total runtime: ${runDurationSeconds}s, session: ${runtime.sessionID})`,
+    );
     runtime.abort.abort();
     for (const pending of runtime.pendingPrompts) {
       clearTimeout(pending.timer);
-      pending.reject(new Error("OpenCode runtime restarted"));
+      pending.reject(new Error("OpenCode runtime stopped"));
     }
     runtime.pendingPrompts = [];
     runtime.close();
     this.runtimes.delete(runtime.channelKey);
+    console.log(`[opencodebot] [${runtime.channelKey}] runtime process closed`);
   }
 
   private async getLatestAssistantMessageID(runtime: RuntimeEntry): Promise<string | undefined> {
@@ -460,6 +486,10 @@ export class ProcessManager {
     }
     const payload = data?.payload ?? data;
     if (!payload?.type) return;
+    
+    // 更新活动时间戳
+    runtime.lastActivityTime = Date.now();
+    
     if (payload.type === "message.part.updated") {
       const part = payload.properties?.part;
       if (!part || part.sessionID !== runtime.sessionID || part.type !== "text") return;
