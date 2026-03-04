@@ -1,11 +1,12 @@
-import { createOpencodeServer } from "@opencode-ai/sdk/server";
 import type { AppConfig } from "../config.js";
 import { SessionStore } from "./session-store.js";
+import { createManagedOpencodeServer, type ManagedServerCloseResult } from "./server-process.js";
 
 type RuntimeEntry = {
   channelKey: string;
   baseUrl: string;
-  close: () => void;
+  close: () => Promise<ManagedServerCloseResult>;
+  pid: number;
   sessionID: string;
   modelOverride?: string;
   currentMode?: string;
@@ -90,7 +91,10 @@ export class ProcessManager {
         try {
           // 首先检查是否空闲超时
           const runtime = this.runtimes.get(channelKey);
-          if (runtime && now - runtime.lastActivityTime > idleTimeoutMs) {
+          if (!runtime) continue;
+          // 仍有进行中的 prompt，不应被判定为空闲
+          if (runtime.pendingPrompts.length > 0) continue;
+          if (now - runtime.lastActivityTime > idleTimeoutMs) {
             console.log(
               `[opencodebot] [${channelKey}] runtime idle for ${Math.round((now - runtime.lastActivityTime) / 1000)}s (limit: ${Math.round(idleTimeoutMs / 1000)}s), disposing`,
             );
@@ -116,7 +120,10 @@ export class ProcessManager {
         clearTimeout(pending.timer);
         pending.reject(new Error("Runtime stopped"));
       }
-      runtime.close();
+      const closeResult = await runtime.close();
+      console.log(
+        `[opencodebot] [${runtime.channelKey}] runtime process closed pid=${runtime.pid} exited=${closeResult.exited} forced=${closeResult.forced}`,
+      );
     }
     this.runtimes.clear();
   }
@@ -309,7 +316,7 @@ export class ProcessManager {
 
   private async createRuntime(channelKey: string, preferredSessionID?: string): Promise<RuntimeEntry> {
     console.log(`[opencodebot] [${channelKey}] starting opencode server process`);
-    const server = await createOpencodeServer({
+    const server = await createManagedOpencodeServer({
       hostname: this.config.opencode?.hostname || "127.0.0.1",
       port: 0,
       timeout: 10000,
@@ -319,6 +326,7 @@ export class ProcessManager {
       channelKey,
       baseUrl: server.url,
       close: server.close,
+      pid: server.pid,
       sessionID: "",
       modelOverride: this.sessions.get(channelKey)?.model,
       currentMode: "build",
@@ -333,7 +341,9 @@ export class ProcessManager {
     const saved = preferredSessionID || this.sessions.get(channelKey)?.sessionID;
     if (saved && (await this.sessionExists(runtime.baseUrl, saved))) {
       runtime.sessionID = saved;
-      console.log(`[opencodebot] [${channelKey}] runtime process opened (restored session: ${saved} @ ${runtime.baseUrl})`);
+      console.log(
+        `[opencodebot] [${channelKey}] runtime process opened pid=${runtime.pid} (restored session: ${saved} @ ${runtime.baseUrl})`,
+      );
     } else {
       const created = await requestJson<{ id: string }>(this.config, runtime.baseUrl, "/session", {
         method: "POST",
@@ -341,7 +351,9 @@ export class ProcessManager {
       });
       runtime.sessionID = created.id;
       await this.sessions.set(channelKey, created.id);
-      console.log(`[opencodebot] [${channelKey}] runtime process opened (created session: ${created.id} @ ${runtime.baseUrl})`);
+      console.log(
+        `[opencodebot] [${channelKey}] runtime process opened pid=${runtime.pid} (created session: ${created.id} @ ${runtime.baseUrl})`,
+      );
     }
 
     this.runtimes.set(channelKey, runtime);
@@ -364,7 +376,7 @@ export class ProcessManager {
     const idleSeconds = Math.round((Date.now() - runtime.lastActivityTime) / 1000);
     const runDurationSeconds = Math.round((Date.now() - runtime.createdAt) / 1000);
     console.log(
-      `[opencodebot] [${runtime.channelKey}] closing runtime process (idle: ${idleSeconds}s, total runtime: ${runDurationSeconds}s, session: ${runtime.sessionID})`,
+      `[opencodebot] [${runtime.channelKey}] closing runtime process pid=${runtime.pid} (idle: ${idleSeconds}s, total runtime: ${runDurationSeconds}s, session: ${runtime.sessionID})`,
     );
     runtime.abort.abort();
     for (const pending of runtime.pendingPrompts) {
@@ -372,9 +384,11 @@ export class ProcessManager {
       pending.reject(new Error("OpenCode runtime stopped"));
     }
     runtime.pendingPrompts = [];
-    runtime.close();
+    const closeResult = await runtime.close();
     this.runtimes.delete(runtime.channelKey);
-    console.log(`[opencodebot] [${runtime.channelKey}] runtime process closed`);
+    console.log(
+      `[opencodebot] [${runtime.channelKey}] runtime process closed pid=${runtime.pid} exited=${closeResult.exited} forced=${closeResult.forced}`,
+    );
   }
 
   private async getLatestAssistantMessageID(runtime: RuntimeEntry): Promise<string | undefined> {
@@ -487,17 +501,20 @@ export class ProcessManager {
     const payload = data?.payload ?? data;
     if (!payload?.type) return;
     
-    // 更新活动时间戳
-    runtime.lastActivityTime = Date.now();
-    
     if (payload.type === "message.part.updated") {
       const part = payload.properties?.part;
       if (!part || part.sessionID !== runtime.sessionID || part.type !== "text") return;
+      const nextText = String(part.text ?? "");
+      const previousText = runtime.messageTexts.get(part.messageID);
+      // 仅在文本内容真正变化时刷新活动时间，避免重复事件导致空闲计时被重置
+      if (nextText !== previousText) {
+        runtime.lastActivityTime = Date.now();
+      }
       if (!runtime.messageTexts.has(part.messageID)) {
         runtime.messageOrder.push(part.messageID);
       }
       runtime.latestMessageID = part.messageID;
-      runtime.messageTexts.set(part.messageID, String(part.text ?? ""));
+      runtime.messageTexts.set(part.messageID, nextText);
       return;
     }
     if (payload.type === "message.updated") {
@@ -542,6 +559,7 @@ export class ProcessManager {
       clearTimeout(pending.timer);
       const messageID = this.pickCompletedMessage(runtime, pending.baselineMessageID);
       const text = (messageID && runtime.messageTexts.get(messageID)) || "(no text response)";
+      runtime.lastActivityTime = Date.now();
       console.log(
         `[opencodebot] [${runtime.channelKey}] session idle, completing pending prompt messageID=${messageID ?? "n/a"}`,
       );

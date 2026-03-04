@@ -5,6 +5,24 @@ import { ProcessManager } from "./opencode/process-manager.js";
 import { SessionStore } from "./opencode/session-store.js";
 import { syncCronSkillToGlobal } from "./opencode/skills.js";
 
+function installTimestampedConsole() {
+  const formatLocalTimestamp = (date: Date) => {
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(
+      date.getMinutes(),
+    )}:${pad(date.getSeconds())}`;
+  };
+  const methods: Array<"log" | "info" | "warn" | "error" | "debug"> = ["log", "info", "warn", "error", "debug"];
+  for (const method of methods) {
+    const original = console[method].bind(console);
+    console[method] = (...args: unknown[]) => {
+      original(`[${formatLocalTimestamp(new Date())}]`, ...args);
+    };
+  }
+}
+
+installTimestampedConsole();
+
 async function main() {
   const config = await loadConfig();
   const discord = config.channels?.discord;
