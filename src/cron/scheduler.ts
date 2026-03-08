@@ -131,6 +131,10 @@ export class CronScheduler {
     this.runLog = new CronRunLog(options.runsDir || DEFAULT_RUNS_DIR);
   }
 
+  get jobsPath(): string {
+    return this.options.jobsPath ?? DEFAULT_JOBS_PATH;
+  }
+
   async start(): Promise<void> {
     if (!this.options.enabled) {
       console.log("[opencodebot] cron disabled");
@@ -483,18 +487,24 @@ export function parseCronDraftFromText(text: string): CronJobDraft | undefined {
   }
 }
 
-export function defaultCronOptions(config: {
-  enabled?: boolean;
-  maxConcurrentRuns?: number;
-  catchUpWindowMinutes?: number;
-  maxCatchUpRunsPerJob?: number;
-  defaultTimeoutMs?: number;
-}) {
+export function defaultCronOptions(
+  config: {
+    enabled?: boolean;
+    maxConcurrentRuns?: number;
+    catchUpWindowMinutes?: number;
+    maxCatchUpRunsPerJob?: number;
+    defaultTimeoutMs?: number;
+  },
+  homeDir?: string,
+) {
+  const root = homeDir ? join(homeDir, "cron") : DEFAULT_ROOT;
   return {
     enabled: config.enabled === true,
     maxConcurrentRuns: Math.max(1, config.maxConcurrentRuns ?? 2),
     catchUpWindowMinutes: Math.max(1, config.catchUpWindowMinutes ?? 60),
     maxCatchUpRunsPerJob: Math.max(1, config.maxCatchUpRunsPerJob ?? 20),
     defaultTimeoutMs: Math.max(10_000, config.defaultTimeoutMs ?? 600_000),
+    jobsPath: join(root, "jobs.json"),
+    runsDir: join(root, "runs"),
   };
 }

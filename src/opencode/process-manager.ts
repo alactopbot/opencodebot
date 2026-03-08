@@ -2,31 +2,69 @@ import type { AppConfig } from "../config.js";
 import { SessionStore } from "./session-store.js";
 import { createManagedOpencodeServer, type ManagedServerCloseResult } from "./server-process.js";
 
-type RuntimeEntry = {
-  channelKey: string;
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+type PendingPrompt = {
+  baselineMessageID?: string;
+  resolve: (value: string) => void;
+  reject: (reason?: unknown) => void;
+  timer: NodeJS.Timeout;
+};
+
+/** Tracks in-session message state for one session (main or channel child). */
+type SessionMessageState = {
+  pendingPrompts: PendingPrompt[];
+  messageOrder: string[];
+  messageTexts: Map<string, string>;
+  latestMessageID?: string;
+  lastActivityTime: number;
+};
+
+/** The single shared opencode server process for this bot instance. */
+type SharedRuntime = {
   baseUrl: string;
-  close: () => Promise<ManagedServerCloseResult>;
   pid: number;
+  close: () => Promise<ManagedServerCloseResult>;
+  mainSessionID: string;
+  abort: AbortController;
+  streamTask: Promise<void>;
+  /** sessionID → channelKey (or "main") — used by SSE dispatcher */
+  sessionIndex: Map<string, string>;
+  mainState: SessionMessageState;
+  createdAt: number;
+};
+
+/** Per-channel entry: no process ownership, just session tracking. */
+type ChannelEntry = {
+  channelKey: string;
   sessionID: string;
   modelOverride?: string;
   currentMode?: string;
-  abort: AbortController;
-  streamTask?: Promise<void>;
-  latestMessageID?: string;
-  messageOrder: string[];
-  messageTexts: Map<string, string>;
-  pendingPrompts: Array<{
-    baselineMessageID?: string;
-    resolve: (value: string) => void;
-    reject: (reason?: unknown) => void;
-    timer: NodeJS.Timeout;
-  }>;
-  lastActivityTime: number;
+  state: SessionMessageState;
   createdAt: number;
 };
 
 type JsonRecord = Record<string, unknown>;
+
+const MAIN_KEY = "__main__";
+// DEFAULT_DELEGATION_TOKEN reserved for future main agent routing feature
+
 const preview = (text: string, size = 120) => (text.length > size ? `${text.slice(0, size)}...` : text);
+
+function newMessageState(): SessionMessageState {
+  return {
+    pendingPrompts: [],
+    messageOrder: [],
+    messageTexts: new Map(),
+    lastActivityTime: Date.now(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
 
 function parseModelSpec(spec?: string): { providerID: string; modelID: string } | undefined {
   if (!spec) return undefined;
@@ -34,10 +72,7 @@ function parseModelSpec(spec?: string): { providerID: string; modelID: string } 
   if (!trimmed) return undefined;
   const idx = trimmed.indexOf("/");
   if (idx <= 0 || idx >= trimmed.length - 1) return undefined;
-  return {
-    providerID: trimmed.slice(0, idx),
-    modelID: trimmed.slice(idx + 1),
-  };
+  return { providerID: trimmed.slice(0, idx), modelID: trimmed.slice(idx + 1) };
 }
 
 function authHeader(config: AppConfig) {
@@ -65,14 +100,17 @@ async function requestJson<T>(
   if (!res.ok) {
     throw new Error(`${path} failed: ${res.status} ${res.statusText}`);
   }
-  if (res.status === 204) {
-    return undefined as T;
-  }
+  if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
 
+// ---------------------------------------------------------------------------
+// ProcessManager
+// ---------------------------------------------------------------------------
+
 export class ProcessManager {
-  private readonly runtimes = new Map<string, RuntimeEntry>();
+  private sharedRuntime?: SharedRuntime;
+  private readonly channels = new Map<string, ChannelEntry>();
   private monitorTimer?: NodeJS.Timeout;
 
   constructor(
@@ -84,86 +122,62 @@ export class ProcessManager {
     await this.sessions.load();
     console.log("[opencodebot] session store loaded, runtime monitor starting");
     this.monitorTimer = setInterval(async () => {
-      const now = Date.now();
-      const idleTimeoutMs = this.config.opencode?.runtimeIdleTimeoutMs ?? 10 * 60 * 1000; // 默认 10 分钟
-      
-      for (const [channelKey] of this.runtimes) {
-        try {
-          // 首先检查是否空闲超时
-          const runtime = this.runtimes.get(channelKey);
-          if (!runtime) continue;
-          // 仍有进行中的 prompt，不应被判定为空闲
-          if (runtime.pendingPrompts.length > 0) continue;
-          if (now - runtime.lastActivityTime > idleTimeoutMs) {
-            console.log(
-              `[opencodebot] [${channelKey}] runtime idle for ${Math.round((now - runtime.lastActivityTime) / 1000)}s (limit: ${Math.round(idleTimeoutMs / 1000)}s), disposing`,
-            );
-            await this.disposeRuntime(runtime);
-            continue;
-          }
-          
-          // 然后检查健康状态
-          await this.recoverIfUnhealthy(channelKey);
-        } catch (error) {
-          console.error(`[opencodebot] runtime monitor failed for ${channelKey}`, error);
-        }
-      }
+      await this.runMonitor();
     }, 15000);
   }
 
   async stopAll() {
     if (this.monitorTimer) clearInterval(this.monitorTimer);
-    console.log(`[opencodebot] stopping ${this.runtimes.size} opencode runtime(s)`);
-    for (const runtime of this.runtimes.values()) {
-      runtime.abort.abort();
-      for (const pending of runtime.pendingPrompts) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error("Runtime stopped"));
-      }
-      const closeResult = await runtime.close();
-      console.log(
-        `[opencodebot] [${runtime.channelKey}] runtime process closed pid=${runtime.pid} exited=${closeResult.exited} forced=${closeResult.forced}`,
-      );
+    if (this.sharedRuntime) {
+      await this.disposeSharedRuntime(this.sharedRuntime);
     }
-    this.runtimes.clear();
   }
 
+  // -------------------------------------------------------------------------
+  // Public API (signature-compatible with old ProcessManager)
+  // -------------------------------------------------------------------------
+
   async resetSession(channelKey: string): Promise<string> {
-    const runtime = await this.ensureRuntime(channelKey);
+    const runtime = await this.ensureSharedRuntime();
+    const entry = await this.ensureChannelEntry(channelKey, runtime);
     console.log(`[opencodebot] [${channelKey}] creating new session`);
     const created = await requestJson<{ id: string }>(this.config, runtime.baseUrl, "/session", {
       method: "POST",
-      body: JSON.stringify({}),
+      body: JSON.stringify({ parentID: runtime.mainSessionID }),
     });
-    runtime.sessionID = created.id;
+    entry.sessionID = created.id;
+    entry.state = newMessageState();
+    runtime.sessionIndex.set(created.id, channelKey);
     await this.sessions.set(channelKey, created.id);
     console.log(`[opencodebot] [${channelKey}] new session created: ${created.id}`);
     return created.id;
   }
 
   async listSessions(channelKey: string): Promise<Array<{ id: string; title: string }>> {
-    const runtime = await this.ensureRuntime(channelKey);
+    const runtime = await this.ensureSharedRuntime();
     return await requestJson<Array<{ id: string; title: string }>>(this.config, runtime.baseUrl, "/session", {
       method: "GET",
     });
   }
 
   async setModel(channelKey: string, model: string): Promise<void> {
-    const runtime = await this.ensureRuntime(channelKey);
-    const parsed = await this.resolveModelSpec(runtime, model);
-    runtime.modelOverride = `${parsed.providerID}/${parsed.modelID}`;
-    await this.sessions.setModel(channelKey, runtime.modelOverride);
-    console.log(`[opencodebot] [${channelKey}] model override set to ${runtime.modelOverride}`);
+    const runtime = await this.ensureSharedRuntime();
+    const entry = await this.ensureChannelEntry(channelKey, runtime);
+    const parsed = await this.resolveModelSpec(entry, runtime, model);
+    entry.modelOverride = `${parsed.providerID}/${parsed.modelID}`;
+    await this.sessions.setModel(channelKey, entry.modelOverride);
+    console.log(`[opencodebot] [${channelKey}] model override set to ${entry.modelOverride}`);
   }
 
   async getModel(channelKey: string): Promise<{ override?: string; current?: string }> {
-    const runtime = await this.ensureRuntime(channelKey);
+    const runtime = await this.ensureSharedRuntime();
+    const entry = await this.ensureChannelEntry(channelKey, runtime);
     let current: string | undefined;
     try {
       const messages = await requestJson<Array<{ info?: JsonRecord }>>(
         this.config,
         runtime.baseUrl,
-        `/session/${runtime.sessionID}/message?limit=20`,
+        `/session/${entry.sessionID}/message?limit=20`,
         { method: "GET" },
       );
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -176,11 +190,11 @@ export class ProcessManager {
     } catch {
       // ignore
     }
-    return { override: runtime.modelOverride, current };
+    return { override: entry.modelOverride, current };
   }
 
   async listModels(channelKey: string): Promise<string[]> {
-    const runtime = await this.ensureRuntime(channelKey);
+    const runtime = await this.ensureSharedRuntime();
     console.log(`[opencodebot] [${channelKey}] -> opencode list models`);
     const response = await requestJson<{
       providers?: Array<{ id?: string; models?: Record<string, { id?: string; name?: string }> }>;
@@ -201,18 +215,16 @@ export class ProcessManager {
   }
 
   async runSlashCommand(channelKey: string, command: string, args: string[] = []): Promise<string> {
-    const runtime = await this.ensureRuntime(channelKey);
+    const runtime = await this.ensureSharedRuntime();
+    const entry = await this.ensureChannelEntry(channelKey, runtime);
     console.log(`[opencodebot] [${channelKey}] -> opencode slash command: /${command} ${args.join(" ")}`);
     const response = await requestJson<{ parts: Array<JsonRecord> }>(
       this.config,
       runtime.baseUrl,
-      `/session/${runtime.sessionID}/command`,
+      `/session/${entry.sessionID}/command`,
       {
         method: "POST",
-        body: JSON.stringify({
-          command,
-          arguments: args,
-        }),
+        body: JSON.stringify({ command, arguments: args }),
       },
     );
     const text = this.extractText(response.parts) || "Done.";
@@ -228,54 +240,76 @@ export class ProcessManager {
     return this.promptInternal(channelKey, text, undefined, "plan");
   }
 
+  // -------------------------------------------------------------------------
+  // Routing: messages go directly to the channel's child session.
+  // The main session exists as a structural parent but does not intercept
+  // messages. Main agent routing logic is reserved for future use.
+  // -------------------------------------------------------------------------
+
   private async promptInternal(
     channelKey: string,
     text: string,
     systemPrompt?: string,
     agentOverride?: string,
   ): Promise<string> {
-    const runtime = await this.ensureRuntime(channelKey);
-    runtime.lastActivityTime = Date.now();
-    console.log(
-      `[opencodebot] [${channelKey}] -> opencode prompt(session=${runtime.sessionID}) text="${preview(text)}"${
-        systemPrompt ? " with systemPrompt" : ""
-      }${runtime.modelOverride ? ` model=${runtime.modelOverride}` : ""}${agentOverride ? ` agent=${agentOverride}` : ""}`,
+    const runtime = await this.ensureSharedRuntime();
+    const entry = await this.ensureChannelEntry(channelKey, runtime);
+
+    entry.state.lastActivityTime = Date.now();
+    return await this.sendToSession(
+      runtime,
+      entry.sessionID,
+      entry.state,
+      channelKey,
+      text,
+      systemPrompt,
+      entry.modelOverride,
+      agentOverride,
     );
-    const baselineMessageID = await this.getLatestAssistantMessageID(runtime);
+  }
+
+  private async sendToSession(
+    runtime: SharedRuntime,
+    sessionID: string,
+    state: SessionMessageState,
+    logKey: string,
+    text: string,
+    systemPrompt?: string,
+    modelOverride?: string,
+    agentOverride?: string,
+  ): Promise<string> {
+    state.lastActivityTime = Date.now();
+    console.log(
+      `[opencodebot] [${logKey}] -> opencode session=${sessionID} text="${preview(text)}"` +
+        (systemPrompt ? " with systemPrompt" : "") +
+        (modelOverride ? ` model=${modelOverride}` : "") +
+        (agentOverride ? ` agent=${agentOverride}` : ""),
+    );
+
+    const baselineMessageID = await this.getLatestAssistantMessageID(runtime, sessionID);
     const result = new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => {
         reject(new Error("Timed out waiting for OpenCode response"));
       }, 180000);
-      runtime.pendingPrompts.push({ baselineMessageID, resolve, reject, timer });
+      state.pendingPrompts.push({ baselineMessageID, resolve, reject, timer });
     });
-    const body: JsonRecord = {
-      parts: [{ type: "text", text }],
-    };
-    if (agentOverride) {
-      body.agent = agentOverride;
-    }
-    const parsedModel = parseModelSpec(runtime.modelOverride);
-    if (parsedModel) {
-      body.model = parsedModel;
-    }
-    if (systemPrompt) {
-      body.system = systemPrompt;
-    }
+
+    const body: JsonRecord = { parts: [{ type: "text", text }] };
+    if (agentOverride) body.agent = agentOverride;
+    const parsedModel = parseModelSpec(modelOverride);
+    if (parsedModel) body.model = parsedModel;
+    if (systemPrompt) body.system = systemPrompt;
+
     try {
-      await requestJson(
-        this.config,
-        runtime.baseUrl,
-        `/session/${runtime.sessionID}/prompt_async`,
-        {
-          method: "POST",
-          body: JSON.stringify(body),
-        },
-      );
+      await requestJson(this.config, runtime.baseUrl, `/session/${sessionID}/prompt_async`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
       const response = await result;
-      console.log(`[opencodebot] [${channelKey}] <- opencode response: ${preview(response)}`);
+      console.log(`[opencodebot] [${logKey}] <- opencode response: "${preview(response)}"`);
       return response;
     } catch (error) {
-      const pending = runtime.pendingPrompts.pop();
+      const pending = state.pendingPrompts.pop();
       if (pending) {
         clearTimeout(pending.timer);
         pending.reject(error);
@@ -284,17 +318,184 @@ export class ProcessManager {
     }
   }
 
-  private async ensureRuntime(channelKey: string): Promise<RuntimeEntry> {
-    const existing = this.runtimes.get(channelKey);
-    if (existing && (await this.isHealthy(existing.baseUrl))) {
-      return existing;
+  // -------------------------------------------------------------------------
+  // Runtime lifecycle
+  // -------------------------------------------------------------------------
+
+  private async ensureSharedRuntime(): Promise<SharedRuntime> {
+    if (this.sharedRuntime && (await this.isHealthy(this.sharedRuntime.baseUrl))) {
+      return this.sharedRuntime;
     }
-    if (existing) {
-      await this.disposeRuntime(existing);
+    if (this.sharedRuntime) {
+      await this.disposeSharedRuntime(this.sharedRuntime);
+    }
+    return await this.createSharedRuntime();
+  }
+
+  private async createSharedRuntime(): Promise<SharedRuntime> {
+    console.log("[opencodebot] starting shared opencode server process");
+    const server = await createManagedOpencodeServer({
+      hostname: this.config.opencode?.hostname || "127.0.0.1",
+      port: 0,
+      timeout: 10000,
+    });
+
+    const sessionIndex = new Map<string, string>();
+    const runtime: SharedRuntime = {
+      baseUrl: server.url,
+      pid: server.pid,
+      close: server.close,
+      mainSessionID: "",
+      abort: new AbortController(),
+      streamTask: Promise.resolve(),
+      sessionIndex,
+      mainState: newMessageState(),
+      createdAt: Date.now(),
+    };
+
+    // Restore or create main session
+    const savedMainID = this.sessions.getMainSessionID();
+    if (savedMainID && (await this.sessionExists(runtime.baseUrl, savedMainID))) {
+      runtime.mainSessionID = savedMainID;
+      console.log(`[opencodebot] shared process pid=${runtime.pid} restored main session: ${savedMainID} @ ${runtime.baseUrl}`);
+    } else {
+      const created = await requestJson<{ id: string }>(this.config, runtime.baseUrl, "/session", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      runtime.mainSessionID = created.id;
+      await this.sessions.setMainSessionID(created.id);
+      console.log(`[opencodebot] shared process pid=${runtime.pid} created main session: ${created.id} @ ${runtime.baseUrl}`);
+    }
+    sessionIndex.set(runtime.mainSessionID, MAIN_KEY);
+
+    // Restore channel sessions into the index
+    for (const [channelKey, entry] of this.channels) {
+      if (entry.sessionID) {
+        sessionIndex.set(entry.sessionID, channelKey);
+      }
     }
 
-    return await this.createRuntime(channelKey);
+    this.sharedRuntime = runtime;
+    runtime.streamTask = this.startEventStream(runtime);
+    return runtime;
   }
+
+  private async ensureChannelEntry(channelKey: string, runtime: SharedRuntime): Promise<ChannelEntry> {
+    const existing = this.channels.get(channelKey);
+    if (existing) {
+      // Verify session still exists on server
+      if (await this.sessionExists(runtime.baseUrl, existing.sessionID)) {
+        return existing;
+      }
+      runtime.sessionIndex.delete(existing.sessionID);
+    }
+
+    // Create (or restore) child session
+    const savedRecord = this.sessions.get(channelKey);
+    let sessionID: string;
+
+    if (savedRecord?.sessionID && (await this.sessionExists(runtime.baseUrl, savedRecord.sessionID))) {
+      sessionID = savedRecord.sessionID;
+      console.log(`[opencodebot] [${channelKey}] restored child session: ${sessionID}`);
+    } else {
+      const created = await requestJson<{ id: string }>(this.config, runtime.baseUrl, "/session", {
+        method: "POST",
+        body: JSON.stringify({ parentID: runtime.mainSessionID }),
+      });
+      sessionID = created.id;
+      await this.sessions.set(channelKey, sessionID);
+      console.log(`[opencodebot] [${channelKey}] created child session: ${sessionID} (parent: ${runtime.mainSessionID})`);
+    }
+
+    const entry: ChannelEntry = {
+      channelKey,
+      sessionID,
+      modelOverride: savedRecord?.model,
+      currentMode: "build",
+      state: newMessageState(),
+      createdAt: Date.now(),
+    };
+    this.channels.set(channelKey, entry);
+    runtime.sessionIndex.set(sessionID, channelKey);
+    return entry;
+  }
+
+  private async disposeSharedRuntime(runtime: SharedRuntime) {
+    const runDurationSeconds = Math.round((Date.now() - runtime.createdAt) / 1000);
+    console.log(
+      `[opencodebot] closing shared process pid=${runtime.pid} (total runtime: ${runDurationSeconds}s)`,
+    );
+    runtime.abort.abort();
+    // Reject all pending prompts across all sessions
+    for (const pending of runtime.mainState.pendingPrompts) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("OpenCode runtime stopped"));
+    }
+    for (const entry of this.channels.values()) {
+      for (const pending of entry.state.pendingPrompts) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error("OpenCode runtime stopped"));
+      }
+      entry.state.pendingPrompts = [];
+    }
+    runtime.mainState.pendingPrompts = [];
+    // Clear channel in-memory state (session IDs are persisted; will be restored on next use)
+    this.channels.clear();
+    const closeResult = await runtime.close();
+    this.sharedRuntime = undefined;
+    console.log(
+      `[opencodebot] shared process closed pid=${runtime.pid} exited=${closeResult.exited} forced=${closeResult.forced}`,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Idle monitor
+  // -------------------------------------------------------------------------
+
+  private async runMonitor() {
+    if (!this.sharedRuntime) return;
+    const runtime = this.sharedRuntime;
+    const now = Date.now();
+    const idleTimeoutMs = this.config.opencode?.runtimeIdleTimeoutMs ?? 10 * 60 * 1000;
+
+    // Check for any pending prompts across all sessions
+    const hasActive =
+      runtime.mainState.pendingPrompts.length > 0 ||
+      Array.from(this.channels.values()).some((e) => e.state.pendingPrompts.length > 0);
+    if (hasActive) return;
+
+    // Compute last activity across main state and all channel states
+    let lastActivity = runtime.mainState.lastActivityTime;
+    for (const entry of this.channels.values()) {
+      if (entry.state.lastActivityTime > lastActivity) {
+        lastActivity = entry.state.lastActivityTime;
+      }
+    }
+
+    if (now - lastActivity > idleTimeoutMs) {
+      console.log(
+        `[opencodebot] shared process idle for ${Math.round((now - lastActivity) / 1000)}s (limit: ${Math.round(idleTimeoutMs / 1000)}s), disposing`,
+      );
+      await this.disposeSharedRuntime(runtime);
+      return;
+    }
+
+    // Health check
+    try {
+      if (!(await this.isHealthy(runtime.baseUrl))) {
+        console.warn("[opencodebot] shared process unhealthy, rebuilding");
+        await this.disposeSharedRuntime(runtime);
+        await this.createSharedRuntime();
+      }
+    } catch (error) {
+      console.error("[opencodebot] runtime monitor error", error);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Helpers
+  // -------------------------------------------------------------------------
 
   private async isHealthy(baseUrl: string): Promise<boolean> {
     try {
@@ -314,89 +515,12 @@ export class ProcessManager {
     }
   }
 
-  private async createRuntime(channelKey: string, preferredSessionID?: string): Promise<RuntimeEntry> {
-    console.log(`[opencodebot] [${channelKey}] starting opencode server process`);
-    const server = await createManagedOpencodeServer({
-      hostname: this.config.opencode?.hostname || "127.0.0.1",
-      port: 0,
-      timeout: 10000,
-    });
-    const now = Date.now();
-    const runtime: RuntimeEntry = {
-      channelKey,
-      baseUrl: server.url,
-      close: server.close,
-      pid: server.pid,
-      sessionID: "",
-      modelOverride: this.sessions.get(channelKey)?.model,
-      currentMode: "build",
-      abort: new AbortController(),
-      messageOrder: [],
-      messageTexts: new Map(),
-      pendingPrompts: [],
-      lastActivityTime: now,
-      createdAt: now,
-    };
-
-    const saved = preferredSessionID || this.sessions.get(channelKey)?.sessionID;
-    if (saved && (await this.sessionExists(runtime.baseUrl, saved))) {
-      runtime.sessionID = saved;
-      console.log(
-        `[opencodebot] [${channelKey}] runtime process opened pid=${runtime.pid} (restored session: ${saved} @ ${runtime.baseUrl})`,
-      );
-    } else {
-      const created = await requestJson<{ id: string }>(this.config, runtime.baseUrl, "/session", {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
-      runtime.sessionID = created.id;
-      await this.sessions.set(channelKey, created.id);
-      console.log(
-        `[opencodebot] [${channelKey}] runtime process opened pid=${runtime.pid} (created session: ${created.id} @ ${runtime.baseUrl})`,
-      );
-    }
-
-    this.runtimes.set(channelKey, runtime);
-    runtime.streamTask = this.startEventStream(runtime);
-    return runtime;
-  }
-
-  private async recoverIfUnhealthy(channelKey: string) {
-    const runtime = this.runtimes.get(channelKey);
-    if (!runtime) return;
-    if (await this.isHealthy(runtime.baseUrl)) return;
-    console.warn(`[opencodebot] [${channelKey}] runtime unhealthy, rebuilding process`);
-    const previousSession = runtime.sessionID;
-    await this.disposeRuntime(runtime);
-    await this.createRuntime(channelKey, previousSession);
-    console.log(`[opencodebot] [${channelKey}] runtime recovered`);
-  }
-
-  private async disposeRuntime(runtime: RuntimeEntry) {
-    const idleSeconds = Math.round((Date.now() - runtime.lastActivityTime) / 1000);
-    const runDurationSeconds = Math.round((Date.now() - runtime.createdAt) / 1000);
-    console.log(
-      `[opencodebot] [${runtime.channelKey}] closing runtime process pid=${runtime.pid} (idle: ${idleSeconds}s, total runtime: ${runDurationSeconds}s, session: ${runtime.sessionID})`,
-    );
-    runtime.abort.abort();
-    for (const pending of runtime.pendingPrompts) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error("OpenCode runtime stopped"));
-    }
-    runtime.pendingPrompts = [];
-    const closeResult = await runtime.close();
-    this.runtimes.delete(runtime.channelKey);
-    console.log(
-      `[opencodebot] [${runtime.channelKey}] runtime process closed pid=${runtime.pid} exited=${closeResult.exited} forced=${closeResult.forced}`,
-    );
-  }
-
-  private async getLatestAssistantMessageID(runtime: RuntimeEntry): Promise<string | undefined> {
+  private async getLatestAssistantMessageID(runtime: SharedRuntime, sessionID: string): Promise<string | undefined> {
     try {
       const messages = await requestJson<Array<{ info?: JsonRecord }>>(
         this.config,
         runtime.baseUrl,
-        `/session/${runtime.sessionID}/message?limit=20`,
+        `/session/${sessionID}/message?limit=20`,
         { method: "GET" },
       );
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -405,18 +529,18 @@ export class ProcessManager {
           return info.id;
         }
       }
-      return undefined;
     } catch {
-      return undefined;
+      // ignore
     }
+    return undefined;
   }
 
-  private async getLatestAssistantProvider(runtime: RuntimeEntry): Promise<string | undefined> {
+  private async getLatestAssistantProvider(runtime: SharedRuntime, sessionID: string): Promise<string | undefined> {
     try {
       const messages = await requestJson<Array<{ info?: JsonRecord }>>(
         this.config,
         runtime.baseUrl,
-        `/session/${runtime.sessionID}/message?limit=20`,
+        `/session/${sessionID}/message?limit=20`,
         { method: "GET" },
       );
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -425,26 +549,32 @@ export class ProcessManager {
           return info.providerID;
         }
       }
-      return undefined;
     } catch {
-      return undefined;
+      // ignore
     }
+    return undefined;
   }
 
-  private async resolveModelSpec(runtime: RuntimeEntry, input: string): Promise<{ providerID: string; modelID: string }> {
+  private async resolveModelSpec(
+    entry: ChannelEntry,
+    runtime: SharedRuntime,
+    input: string,
+  ): Promise<{ providerID: string; modelID: string }> {
     const direct = parseModelSpec(input);
     if (direct) return direct;
     const trimmed = input.trim();
-    if (!trimmed) {
-      throw new Error("Invalid model format. Use provider/model or modelID");
-    }
-    const fromOverride = parseModelSpec(runtime.modelOverride)?.providerID;
-    const fromSession = await this.getLatestAssistantProvider(runtime);
+    if (!trimmed) throw new Error("Invalid model format. Use provider/model or modelID");
+    const fromOverride = parseModelSpec(entry.modelOverride)?.providerID;
+    const fromSession = await this.getLatestAssistantProvider(runtime, entry.sessionID);
     const providerID = fromOverride || fromSession || "volcengine";
     return { providerID, modelID: trimmed };
   }
 
-  private async startEventStream(runtime: RuntimeEntry): Promise<void> {
+  // -------------------------------------------------------------------------
+  // SSE streaming (single stream for all sessions)
+  // -------------------------------------------------------------------------
+
+  private async startEventStream(runtime: SharedRuntime): Promise<void> {
     while (!runtime.abort.signal.aborted) {
       try {
         const headers = new Headers();
@@ -455,17 +585,17 @@ export class ProcessManager {
         }
         const res = await fetch(`${runtime.baseUrl}/event`, { headers, signal: runtime.abort.signal });
         if (!res.ok || !res.body) throw new Error(`SSE connect failed ${res.status}`);
-        console.log(`[opencodebot] [${runtime.channelKey}] SSE connected`);
+        console.log("[opencodebot] SSE connected (shared stream)");
         await this.consumeSse(runtime, res.body);
       } catch (error) {
         if (runtime.abort.signal.aborted) break;
-        console.error(`[opencodebot] SSE disconnected for ${runtime.channelKey}`, error);
+        console.error("[opencodebot] SSE disconnected", error);
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     }
   }
 
-  private async consumeSse(runtime: RuntimeEntry, body: ReadableStream<Uint8Array>) {
+  private async consumeSse(runtime: SharedRuntime, body: ReadableStream<Uint8Array>) {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -491,7 +621,7 @@ export class ProcessManager {
     }
   }
 
-  private handleEvent(runtime: RuntimeEntry, raw: string) {
+  private handleEvent(runtime: SharedRuntime, raw: string) {
     let data: any;
     try {
       data = JSON.parse(raw);
@@ -500,75 +630,87 @@ export class ProcessManager {
     }
     const payload = data?.payload ?? data;
     if (!payload?.type) return;
-    
+
     if (payload.type === "message.part.updated") {
       const part = payload.properties?.part;
-      if (!part || part.sessionID !== runtime.sessionID || part.type !== "text") return;
+      if (!part || part.type !== "text") return;
+      const state = this.stateForSession(runtime, part.sessionID);
+      if (!state) return;
       const nextText = String(part.text ?? "");
-      const previousText = runtime.messageTexts.get(part.messageID);
-      // 仅在文本内容真正变化时刷新活动时间，避免重复事件导致空闲计时被重置
-      if (nextText !== previousText) {
-        runtime.lastActivityTime = Date.now();
-      }
-      if (!runtime.messageTexts.has(part.messageID)) {
-        runtime.messageOrder.push(part.messageID);
-      }
-      runtime.latestMessageID = part.messageID;
-      runtime.messageTexts.set(part.messageID, nextText);
+      const previousText = state.messageTexts.get(part.messageID);
+      if (nextText !== previousText) state.lastActivityTime = Date.now();
+      if (!state.messageTexts.has(part.messageID)) state.messageOrder.push(part.messageID);
+      state.latestMessageID = part.messageID;
+      state.messageTexts.set(part.messageID, nextText);
       return;
     }
+
     if (payload.type === "message.updated") {
       const info = payload.properties?.info;
-      if (info?.sessionID === runtime.sessionID && info?.role === "assistant" && typeof info?.mode === "string") {
-        if (runtime.currentMode !== info.mode) {
-          runtime.currentMode = info.mode;
-          console.log(`[opencodebot] [${runtime.channelKey}] mode switched to ${runtime.currentMode}`);
+      if (info?.role === "assistant" && typeof info?.mode === "string") {
+        const channelKey = runtime.sessionIndex.get(info.sessionID as string);
+        if (channelKey && channelKey !== MAIN_KEY) {
+          const entry = this.channels.get(channelKey);
+          if (entry && entry.currentMode !== info.mode) {
+            entry.currentMode = info.mode;
+            console.log(`[opencodebot] [${channelKey}] mode switched to ${entry.currentMode}`);
+          }
         }
       }
       return;
     }
+
     if (payload.type === "permission.asked") {
       const req = payload.properties;
       const permissionID = req?.id;
       const sessionID = req?.sessionID;
       const permission = req?.permission;
       const patterns = Array.isArray(req?.patterns) ? req.patterns.join(", ") : "";
-      if (!permissionID || sessionID !== runtime.sessionID) return;
+      const channelKey = runtime.sessionIndex.get(sessionID as string) ?? "unknown";
+      if (!permissionID) return;
       console.warn(
-        `[opencodebot] [${runtime.channelKey}] permission requested id=${permissionID} permission=${permission} patterns=${patterns}`,
+        `[opencodebot] [${channelKey}] permission requested id=${permissionID} permission=${permission} patterns=${patterns}`,
       );
       if (this.config.opencode?.autoApprovePermissions !== false) {
-        void this.replyPermission(runtime, permissionID, "once");
-      } else {
-        console.warn(
-          `[opencodebot] [${runtime.channelKey}] autoApprovePermissions=false, waiting for manual permission handling`,
-        );
+        void this.replyPermission(runtime, sessionID as string, permissionID, "once");
       }
       return;
     }
+
     if (payload.type === "session.status") {
       const status = payload.properties?.status;
       const statusType = typeof status === "string" ? status : status?.type;
-      const sessionID = payload.properties?.sessionID;
-      if (sessionID === runtime.sessionID && statusType && statusType !== "idle") {
-        console.log(`[opencodebot] [${runtime.channelKey}] session status=${statusType}`);
+      const sessionID = payload.properties?.sessionID as string | undefined;
+      if (!sessionID) return;
+      const channelKey = runtime.sessionIndex.get(sessionID) ?? "unknown";
+      if (statusType && statusType !== "idle") {
+        console.log(`[opencodebot] [${channelKey}] session status=${statusType}`);
       }
-      if (sessionID !== runtime.sessionID || statusType !== "idle") return;
-      const pending = runtime.pendingPrompts.shift();
+      if (statusType !== "idle") return;
+
+      const state = this.stateForSession(runtime, sessionID);
+      if (!state) return;
+      const pending = state.pendingPrompts.shift();
       if (!pending) return;
       clearTimeout(pending.timer);
-      const messageID = this.pickCompletedMessage(runtime, pending.baselineMessageID);
-      const text = (messageID && runtime.messageTexts.get(messageID)) || "(no text response)";
-      runtime.lastActivityTime = Date.now();
-      console.log(
-        `[opencodebot] [${runtime.channelKey}] session idle, completing pending prompt messageID=${messageID ?? "n/a"}`,
-      );
+      const messageID = this.pickCompletedMessage(state, pending.baselineMessageID);
+      const text = (messageID && state.messageTexts.get(messageID)) || "(no text response)";
+      state.lastActivityTime = Date.now();
+      console.log(`[opencodebot] [${channelKey}] session idle, completing pending prompt messageID=${messageID ?? "n/a"}`);
       pending.resolve(text.trim());
     }
   }
 
+  private stateForSession(runtime: SharedRuntime, sessionID: string): SessionMessageState | undefined {
+    if (sessionID === runtime.mainSessionID) return runtime.mainState;
+    const channelKey = runtime.sessionIndex.get(sessionID);
+    if (!channelKey || channelKey === MAIN_KEY) return undefined;
+    return this.channels.get(channelKey)?.state;
+  }
+
   private async replyPermission(
-    runtime: RuntimeEntry,
+    runtime: SharedRuntime,
+    sessionID: string,
     permissionID: string,
     response: "once" | "always" | "reject",
   ) {
@@ -576,36 +718,31 @@ export class ProcessManager {
       await requestJson<boolean>(
         this.config,
         runtime.baseUrl,
-        `/session/${runtime.sessionID}/permissions/${permissionID}`,
+        `/session/${sessionID}/permissions/${permissionID}`,
         {
           method: "POST",
           body: JSON.stringify({ response, remember: response === "always" }),
         },
       );
-      console.warn(
-        `[opencodebot] [${runtime.channelKey}] auto-approved permission id=${permissionID} response=${response}`,
-      );
+      console.warn(`[opencodebot] auto-approved permission id=${permissionID} response=${response}`);
     } catch (error) {
-      console.error(
-        `[opencodebot] [${runtime.channelKey}] failed to respond permission id=${permissionID}`,
-        error,
-      );
+      console.error(`[opencodebot] failed to respond permission id=${permissionID}`, error);
     }
   }
 
-  private pickCompletedMessage(runtime: RuntimeEntry, baselineMessageID?: string): string | undefined {
-    for (let i = runtime.messageOrder.length - 1; i >= 0; i--) {
-      const id = runtime.messageOrder[i];
+  private pickCompletedMessage(state: SessionMessageState, baselineMessageID?: string): string | undefined {
+    for (let i = state.messageOrder.length - 1; i >= 0; i--) {
+      const id = state.messageOrder[i];
       if (!baselineMessageID || id !== baselineMessageID) return id;
     }
-    return runtime.latestMessageID;
+    return state.latestMessageID;
   }
 
   private extractText(parts: Array<JsonRecord>): string {
-    const textParts = parts
+    return parts
       .filter((part) => part.type === "text")
       .map((part) => String(part.text ?? ""))
-      .join("");
-    return textParts.trim();
+      .join("")
+      .trim();
   }
 }

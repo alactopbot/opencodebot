@@ -1,3 +1,5 @@
+import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { DiscordChannelAdapter } from "./channels/discord/index.js";
 import { loadConfig } from "./config.js";
 import { CronScheduler, defaultCronOptions } from "./cron/scheduler.js";
@@ -24,7 +26,11 @@ function installTimestampedConsole() {
 installTimestampedConsole();
 
 async function main() {
-  const config = await loadConfig();
+  const defaultConfigPath = join(homedir(), ".opencodebot", "config.json");
+  const configPath = resolve(process.argv[2] ?? defaultConfigPath);
+  const homeDir = dirname(configPath);
+
+  const config = await loadConfig(configPath);
   const discord = config.channels?.discord;
   if (!discord?.enabled) {
     throw new Error("Discord channel is not enabled in config");
@@ -35,13 +41,13 @@ async function main() {
     console.warn("[opencodebot] failed to sync cron skill", error);
   }
 
-  const sessions = new SessionStore();
+  const sessions = new SessionStore(join(homeDir, "sessions.json"));
   const manager = new ProcessManager(config, sessions);
   await manager.initialize();
 
   let adapter: DiscordChannelAdapter;
   const cron = new CronScheduler({
-    ...defaultCronOptions(config.cron || {}),
+    ...defaultCronOptions(config.cron || {}, homeDir),
     runPrompt: async ({ channelKey, prompt, systemPrompt }) => await manager.prompt(channelKey, prompt, systemPrompt),
     notify: async (target, text) => {
       if (!adapter) return;

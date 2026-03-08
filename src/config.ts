@@ -31,6 +31,10 @@ export type AppConfig = {
       username?: string;
       password?: string;
     };
+    /** System prompt for the main agent (coordinator/quality-control layer). */
+    mainAgentSystemPrompt?: string;
+    /** Token output by main agent to signal delegation to child session. Default: "[→SUBAGENT]" */
+    delegationToken?: string;
   };
   cron?: {
     enabled?: boolean;

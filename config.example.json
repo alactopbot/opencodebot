@@ -10,7 +10,10 @@
     "hostname": "127.0.0.1",
     "projectDirectory": "/home/admin/workspace",
     "autoApprovePermissions": true,
-    "runtimeIdleTimeoutMs": 600000
+    "runtimeIdleTimeoutMs": 600000,
+    "_comment_reserved": "mainAgentSystemPrompt and delegationToken are reserved for future main-agent routing and have no effect currently",
+    "mainAgentSystemPrompt": "",
+    "delegationToken": "[→SUBAGENT]"
   },
   "channels": {
     "discord": {

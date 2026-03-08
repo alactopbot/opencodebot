@@ -20,10 +20,11 @@ function buildCronSkillPrompt(input: {
   channelId: string;
   threadId: string | null;
   channelKey: string;
+  cronJobsPath: string;
 }): string {
   return [
     "请先加载并使用名为 cron 的 skill 来完成任务管理。",
-    "你必须通过该 skill 对 ~/.opencodebot/cron/jobs.json 进行增删改查，不要用临时方案。",
+    `你必须通过该 skill 对 ${input.cronJobsPath} 进行增删改查，不要用临时方案。`,
     "schedule 只能是5段cron（min hour day month weekday），严禁使用 @ 开头格式。",
     "如果用户给出具体时刻（如 今天16:20），默认转为每日任务 `20 16 * * *`。",
     `新增任务时必须使用 target: {"guildId":"${input.guildId}","channelId":"${input.channelId}","threadId":${
@@ -257,6 +258,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
             channelId: interaction.channel?.isThread() ? (interaction.channel.parentId || interaction.channelId) : interaction.channelId,
             threadId: interaction.channel?.isThread() ? interaction.channelId : null,
             channelKey: key,
+            cronJobsPath: this.cron.jobsPath,
           }),
         );
         const reconcile = await this.cron.reconcileJobSchedules();
