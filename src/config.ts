@@ -52,6 +52,7 @@ export type AccessResult = {
   allowed: boolean;
   requireMention: boolean;
   systemPrompt?: string;
+  reason?: "guild_not_allowed" | "user_not_allowed" | "channel_not_allowed";
 };
 
 export const CONFIG_PATH = join(homedir(), ".opencodebot", "config.json");
@@ -76,10 +77,10 @@ export function checkDiscordAccess(input: {
   userId: string;
 }): AccessResult {
   const guild = input.cfg.guilds?.[input.guildId];
-  if (!guild) return { allowed: false, requireMention: false };
+  if (!guild) return { allowed: false, requireMention: false, reason: "guild_not_allowed" };
 
   if (guild.users?.length && !guild.users.includes(input.userId)) {
-    return { allowed: false, requireMention: !!guild.requireMention };
+    return { allowed: false, requireMention: !!guild.requireMention, reason: "user_not_allowed" };
   }
 
   if (input.cfg.groupPolicy === "allowlist") {
@@ -87,7 +88,7 @@ export function checkDiscordAccess(input: {
     const parent = input.parentChannelId ? guild.channels?.[input.parentChannelId] : undefined;
     const resolved = direct ?? parent;
     if (!resolved?.allow) {
-      return { allowed: false, requireMention: !!guild.requireMention };
+      return { allowed: false, requireMention: !!guild.requireMention, reason: "channel_not_allowed" };
     }
     return {
       allowed: true,

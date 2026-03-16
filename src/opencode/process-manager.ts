@@ -32,6 +32,10 @@ type SharedRuntime = {
   streamTask: Promise<void>;
   /** sessionID → channelKey (or "main") — used by SSE dispatcher */
   sessionIndex: Map<string, string>;
+  /** Deduplicate noisy session.status logs by tracking latest known status per session. */
+  lastStatusBySession: Map<string, string>;
+  /** Additional channel-level status dedupe to collapse duplicated events in noisy/multi-worker cases. */
+  lastStatusByChannel: Map<string, string>;
   mainState: SessionMessageState;
   createdAt: number;
 };
@@ -141,12 +145,15 @@ export class ProcessManager {
     const runtime = await this.ensureSharedRuntime();
     const entry = await this.ensureChannelEntry(channelKey, runtime);
     console.log(`[opencodebot] [${channelKey}] creating new session`);
+    const oldSessionID = entry.sessionID;
     const created = await requestJson<{ id: string }>(this.config, runtime.baseUrl, "/session", {
       method: "POST",
       body: JSON.stringify({ parentID: runtime.mainSessionID }),
     });
     entry.sessionID = created.id;
     entry.state = newMessageState();
+    runtime.sessionIndex.delete(oldSessionID);
+    runtime.lastStatusBySession.delete(oldSessionID);
     runtime.sessionIndex.set(created.id, channelKey);
     await this.sessions.set(channelKey, created.id);
     console.log(`[opencodebot] [${channelKey}] new session created: ${created.id}`);
@@ -349,6 +356,8 @@ export class ProcessManager {
       abort: new AbortController(),
       streamTask: Promise.resolve(),
       sessionIndex,
+      lastStatusBySession: new Map<string, string>(),
+      lastStatusByChannel: new Map<string, string>(),
       mainState: newMessageState(),
       createdAt: Date.now(),
     };
@@ -683,7 +692,18 @@ export class ProcessManager {
       const sessionID = payload.properties?.sessionID as string | undefined;
       if (!sessionID) return;
       const channelKey = runtime.sessionIndex.get(sessionID) ?? "unknown";
-      if (statusType && statusType !== "idle") {
+      const previous = runtime.lastStatusBySession.get(sessionID);
+      const previousChannelStatus = runtime.lastStatusByChannel.get(channelKey);
+      if (statusType) {
+        runtime.lastStatusBySession.set(sessionID, statusType);
+        runtime.lastStatusByChannel.set(channelKey, statusType);
+      }
+      if (
+        statusType &&
+        statusType !== "idle" &&
+        previous !== statusType &&
+        previousChannelStatus !== statusType
+      ) {
         console.log(`[opencodebot] [${channelKey}] session status=${statusType}`);
       }
       if (statusType !== "idle") return;

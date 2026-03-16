@@ -1,4 +1,12 @@
-import { ChatInputCommandInteraction, Client, Events, GatewayIntentBits, Message, SlashCommandBuilder } from "discord.js";
+import {
+  ChatInputCommandInteraction,
+  Client,
+  Events,
+  GatewayIntentBits,
+  Message,
+  MessageFlags,
+  SlashCommandBuilder,
+} from "discord.js";
 import { checkDiscordAccess, type DiscordChannelConfig } from "../../config.js";
 import type { ChannelAdapter } from "../types.js";
 import { ProcessManager } from "../../opencode/process-manager.js";
@@ -8,6 +16,8 @@ import { CronScheduler } from "../../cron/scheduler.js";
 import type { CronJobTarget } from "../../cron/types.js";
 
 const MAX_MESSAGE_LENGTH = 2000;
+const INTERACTION_PROGRESS_INITIAL_MS = 20_000;
+const INTERACTION_PROGRESS_INTERVAL_MS = 60_000;
 
 function normalizePrompt(input: string): string {
   return input.replace(/<@!?\d+>/g, "").trim();
@@ -48,6 +58,17 @@ function interactionKey(interaction: ChatInputCommandInteraction): string {
   const guildId = interaction.guildId || "dm";
   const channelId = interaction.channel?.isThread() ? interaction.channel.id : interaction.channelId;
   return `${guildId}:${channelId}`;
+}
+
+function errorCode(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const value = (error as { code?: unknown }).code;
+  return typeof value === "number" ? value : undefined;
+}
+
+function isInteractionTokenError(error: unknown): boolean {
+  const code = errorCode(error);
+  return code === 10062 || code === 50027;
 }
 
 async function sendChunked(
@@ -140,6 +161,73 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     }
   }
 
+  private resolveInteractionChannel(interaction: ChatInputCommandInteraction) {
+    return interaction.channel ?? this.client.channels.fetch(interaction.channelId).catch(() => null);
+  }
+
+  private startProgressNotifier(interaction: ChatInputCommandInteraction, key: string): () => void {
+    let active = true;
+    let interval: NodeJS.Timeout | undefined;
+    const startedAt = Date.now();
+    const notify = async () => {
+      if (!active) return;
+      const elapsedSec = Math.floor((Date.now() - startedAt) / 1000);
+      try {
+        await interaction.followUp({
+          content: `任务仍在执行（${elapsedSec}s），完成后我会继续回复结果。`,
+        });
+      } catch (error) {
+        if (isInteractionTokenError(error)) {
+          console.warn(`[opencodebot] [${key}] interaction token expired during progress update`);
+          active = false;
+          return;
+        }
+        console.warn(`[opencodebot] [${key}] failed to send progress update`, error);
+      }
+    };
+
+    const initial = setTimeout(() => {
+      void notify();
+      interval = setInterval(() => {
+        void notify();
+      }, INTERACTION_PROGRESS_INTERVAL_MS);
+      interval.unref?.();
+    }, INTERACTION_PROGRESS_INITIAL_MS);
+    initial.unref?.();
+
+    return () => {
+      active = false;
+      clearTimeout(initial);
+      if (interval) clearInterval(interval);
+    };
+  }
+
+  private async editReplyOrSend(
+    interaction: ChatInputCommandInteraction,
+    key: string,
+    text: string,
+  ): Promise<void> {
+    const payload = text.slice(0, MAX_MESSAGE_LENGTH);
+    try {
+      await interaction.editReply(payload);
+      return;
+    } catch (error) {
+      if (!isInteractionTokenError(error)) {
+        throw error;
+      }
+      console.warn(
+        `[opencodebot] [${key}] interaction token expired before editReply, fallback to channel send`,
+      );
+    }
+
+    const channel = await this.resolveInteractionChannel(interaction);
+    if (!channel || !("isSendable" in channel) || !channel.isSendable()) {
+      console.error(`[opencodebot] [${key}] fallback send failed: channel unavailable or not sendable`);
+      return;
+    }
+    await sendChunked(channel, payload);
+  }
+
   private async handleMessage(message: Message) {
     if (!message.guildId || message.author.system) return;
     if (message.author.bot && !this.config.allowBots) return;
@@ -155,7 +243,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     const key = conversationKey(message);
     if (!access.allowed) {
       console.log(
-        `[opencodebot] [${key}] discord message blocked by allowlist from user=${message.author.id} channel=${message.channelId}`,
+        `[opencodebot] [${key}] discord message blocked by allowlist reason=${access.reason ?? "unknown"} from user=${message.author.id} channel=${message.channelId}`,
       );
       return;
     }
@@ -184,7 +272,9 @@ export class DiscordChannelAdapter implements ChannelAdapter {
 
   private async handleCommand(interaction: ChatInputCommandInteraction) {
     if (!interaction.guildId || !interaction.channelId) return;
-    const parentId = interaction.channel?.isThread() ? interaction.channel.parentId : null;
+    const channel =
+      interaction.channel ?? (await this.client.channels.fetch(interaction.channelId).catch(() => null));
+    const parentId = channel?.isThread() ? channel.parentId : null;
     const access = checkDiscordAccess({
       cfg: this.config,
       guildId: interaction.guildId,
@@ -193,17 +283,43 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       userId: interaction.user.id,
     });
     if (!access.allowed) {
-      await interaction.reply({ content: "Not allowed here.", ephemeral: true });
+      const reason =
+        access.reason === "user_not_allowed"
+          ? "user is not in guild.users allowlist"
+          : access.reason === "channel_not_allowed"
+            ? "channel/thread is not in guild.channels allowlist"
+            : "guild is not configured in allowlist";
+      try {
+        await interaction.reply({ content: `Not allowed here (${reason}).`, flags: MessageFlags.Ephemeral });
+      } catch (error) {
+        if (isInteractionTokenError(error)) {
+          console.warn(`[opencodebot] interaction denied but token already expired`);
+          return;
+        }
+        throw error;
+      }
       return;
     }
 
     const key = interactionKey(interaction);
-    await interaction.deferReply();
+    try {
+      await interaction.deferReply();
+    } catch (error) {
+      const code = errorCode(error);
+      if (code === 10062) {
+        console.warn(
+          `[opencodebot] [${key}] slash /${interaction.commandName} defer failed: unknown interaction (expired/invalid token)`,
+        );
+        return;
+      }
+      throw error;
+    }
+    const stopProgress = this.startProgressNotifier(interaction, key);
     try {
       if (interaction.commandName === "new") {
         console.log(`[opencodebot] [${key}] discord slash /new`);
         const sessionID = await this.manager.resetSession(key);
-        await interaction.editReply(`Started new session: \`${sessionID}\``);
+        await this.editReplyOrSend(interaction, key, `Started new session: \`${sessionID}\``);
         return;
       }
       if (interaction.commandName === "plan") {
@@ -211,18 +327,18 @@ export class DiscordChannelAdapter implements ChannelAdapter {
         if (task?.trim()) {
           console.log(`[opencodebot] [${key}] discord slash /plan task="${preview(task)}"`);
           const output = await this.manager.promptPlan(key, task.trim());
-          await interaction.editReply(output.slice(0, MAX_MESSAGE_LENGTH));
+          await this.editReplyOrSend(interaction, key, output);
         } else {
           console.log(`[opencodebot] [${key}] discord slash /plan (no task)`);
           const output = await this.manager.runSlashCommand(key, "plan");
-          await interaction.editReply(output.slice(0, MAX_MESSAGE_LENGTH));
+          await this.editReplyOrSend(interaction, key, output);
         }
         return;
       }
       if (interaction.commandName === "compact") {
         console.log(`[opencodebot] [${key}] discord slash /compact`);
         const output = await this.manager.runSlashCommand(key, "compact");
-        await interaction.editReply(output.slice(0, MAX_MESSAGE_LENGTH));
+        await this.editReplyOrSend(interaction, key, output);
         return;
       }
       if (interaction.commandName === "sessions") {
@@ -230,12 +346,12 @@ export class DiscordChannelAdapter implements ChannelAdapter {
         const sessions = await this.manager.listSessions(key);
         const summary =
           sessions.slice(0, 10).map((s) => `- ${s.id} ${s.title || ""}`).join("\n") || "(none)";
-        await interaction.editReply(summary.slice(0, MAX_MESSAGE_LENGTH));
+        await this.editReplyOrSend(interaction, key, summary);
         return;
       }
       if (interaction.commandName === "cron") {
         if (!this.cron?.enabled) {
-          await interaction.editReply("Cron is disabled in config.");
+          await this.editReplyOrSend(interaction, key, "Cron is disabled in config.");
           return;
         }
         try {
@@ -243,9 +359,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
             throw new Error("missing");
           }
         } catch {
-          await interaction.editReply(
-            `cron skill 不存在: \`${globalCronSkillPath()}\`，请先重新下发 skills/cron。`.slice(0, MAX_MESSAGE_LENGTH),
-          );
+          await this.editReplyOrSend(interaction, key, `cron skill 不存在: \`${globalCronSkillPath()}\`，请先重新下发 skills/cron。`);
           return;
         }
         const task = interaction.options.getString("task", true).trim();
@@ -266,15 +380,14 @@ export class DiscordChannelAdapter implements ChannelAdapter {
           `[opencodebot] [${key}] /cron reconcile converted=${reconcile.converted.length} invalid=${reconcile.invalid.length}`,
         );
         if (reconcile.invalid.length > 0) {
-          await interaction.editReply(
-            `cron 写入了不支持的 schedule（任务: ${reconcile.invalid.join(", ")}），请改成5段cron再重试。`.slice(
-              0,
-              MAX_MESSAGE_LENGTH,
-            ),
+          await this.editReplyOrSend(
+            interaction,
+            key,
+            `cron 写入了不支持的 schedule（任务: ${reconcile.invalid.join(", ")}），请改成5段cron再重试。`,
           );
           return;
         }
-        await interaction.editReply(output.slice(0, MAX_MESSAGE_LENGTH));
+        await this.editReplyOrSend(interaction, key, output);
         return;
       }
       if (interaction.commandName === "model") {
@@ -286,14 +399,16 @@ export class DiscordChannelAdapter implements ChannelAdapter {
           console.log(
             `[opencodebot] [${key}] /model applied. requested="${name}" effective="${model.override ?? "none"}"`,
           );
-          await interaction.editReply(`Model override set to: \`${model.override ?? name}\``);
+          await this.editReplyOrSend(interaction, key, `Model override set to: \`${model.override ?? name}\``);
         } else {
           console.log(`[opencodebot] [${key}] discord slash /model`);
           const model = await this.manager.getModel(key);
           console.log(
             `[opencodebot] [${key}] /model query. override="${model.override ?? "none"}" current="${model.current ?? "unknown"}"`,
           );
-          await interaction.editReply(
+          await this.editReplyOrSend(
+            interaction,
+            key,
             `Model override: \`${model.override ?? "(none)"}\`\nCurrent model: \`${model.current ?? "(unknown)"}\``,
           );
         }
@@ -303,7 +418,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
         console.log(`[opencodebot] [${key}] discord slash /models`);
         const models = await this.manager.listModels(key);
         const text = models.length ? models.map((m) => `- ${m}`).join("\n") : "(no models)";
-        await interaction.editReply(text.slice(0, MAX_MESSAGE_LENGTH));
+        await this.editReplyOrSend(interaction, key, text);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -313,13 +428,15 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       );
       try {
         if (interaction.replied || interaction.deferred) {
-          await interaction.editReply(`Error: ${message}`);
+          await this.editReplyOrSend(interaction, key, `Error: ${message}`);
         } else {
-          await interaction.reply(`Error: ${message}`);
+          await interaction.reply({ content: `Error: ${message}` });
         }
       } catch (replyError) {
         console.error(`[opencodebot] [${key}] failed to send slash error reply`, replyError);
       }
+    } finally {
+      stopProgress();
     }
   }
 }
